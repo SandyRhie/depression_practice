@@ -1,0 +1,293 @@
+install.packages("dplyr")
+install.packages("networkD3")
+install.packages("htmlwidgets")
+install.packages("htmltools")
+install.packages("webshot2")
+
+# ── 0. 패키지 설치 및 로드 ──────────────────────────────────
+library(dplyr)
+library(networkD3)
+library(htmlwidgets)
+library(htmltools)
+library(webshot2)
+
+# ── 1. 작업 경로 설정 ───────────────────────────────────────
+setwd("C:/Users/20903/OneDrive/바탕 화면/R 시험/0412 sankey 시도")
+
+hospital_files <- list(
+  KHNMC = "KHNMC_pathway_step4.csv",
+  KWMC  = "KWMC_pathway_step4.csv",
+  AUMC  = "AUMC_pathway_step4.csv",
+  EUMC  = "EUMC_pathway_step4.csv",
+  KDH   = "KDH_pathway_step4.csv"
+)
+
+# ── 2. [fff] / [sse] 접두어 제거 + 첫글자 대문자 통일 ──────
+clean_name <- function(x) {
+  x <- gsub("\\[[a-z]+\\]\\s*", "", x)
+  x <- trimws(x)
+  # 단어별 첫글자 대문자 (Others 포함 자동 처리)
+  x <- tools::toTitleCase(tolower(x))
+  x
+}
+
+# ── 3. 색상 팔레트 ──────────────────────────────────────────
+my_color <- 'd3.scaleOrdinal()
+  .domain([
+    "Escitalopram",
+    "Sertraline",
+    "Fluoxetine",
+    "Paroxetine",
+    "Duloxetine",
+    "Venlafaxine",
+    "Desvenlafaxine",
+    "Milnacipran",
+    "Fluvoxamine",
+    "Trazodone",
+    "Mirtazapine",
+    "Tianeptine",
+    "Amitriptyline",
+    "Nortriptyline",
+    "Vortioxetine",
+    "Agomelatine",
+    "Bupropion",
+    "Quetiapine",
+    "Aripiprazole",
+    "Risperidone",
+    "Olanzapine",
+    "Imipramine",
+    "Lithium",
+    "Others",
+    "중단"
+  ])
+  .range([
+    "#CC88B7",
+    "#ABBAD0",
+    "#D9B0C2",
+    "#53CEDA",
+    "#D3B5AF",
+    "#FCA04C",
+    "#AB847B",
+    "#B4B552",
+    "#A2A2A2",
+    "#FDB2B1",
+    "#62B862",
+    "#DF6262",
+    "#C2D5ED",
+    "#9DCB94",
+    "#9B7EB4",
+    "#5C9CC7",
+    "#FBA04C",
+    "#B6E3EB",
+    "#B9ADC4",
+    "#5C9CC7",
+    "#C8C897",
+    "#FDCC9B",
+    "#D5D5D5",
+    "#E8E8E8",
+    "#BBBBBB"
+  ])'
+
+# ── 4. 약물명 단순화 함수 ────────────────────────────────────
+# top_drugs 안에 있으면 (단일약·조합약 모두) 그대로 표시
+# top_drugs 밖이면 Others
+simplify_drug <- function(drug_str, top_drugs) {
+  if (is.na(drug_str) || drug_str == "" || drug_str == "-") return("-")
+  if (drug_str %in% top_drugs) return(drug_str)
+  return("Others")
+}
+
+# ── 5. Step별 독립적 상위 약물 단순화 함수 ──────────────────
+# 각 Step의 상위 약물을 독립적으로 계산
+# → Step 2, 3에서 새로 등장하는 약물도 Others가 아닌 본래 이름으로 표시
+simplify_sankey3 <- function(df, top_n = 5) {
+  
+  get_top <- function(col) {
+    df %>%
+      filter(!is.na(.data[[col]]), .data[[col]] != "-") %>%
+      group_by(drug = .data[[col]]) %>%
+      summarise(total = sum(pathwayPercent), .groups = "drop") %>%
+      arrange(desc(total)) %>%
+      slice_head(n = top_n) %>%
+      pull(drug)
+  }
+  
+  top_s1 <- get_top("Step1")
+  top_s2 <- get_top("Step2")
+  top_s3 <- get_top("Step3")
+  
+  df <- df %>%
+    rowwise() %>%
+    mutate(
+      Step1_grp = simplify_drug(Step1, top_s1),
+      Step2_grp = simplify_drug(Step2, top_s2),
+      Step3_grp = simplify_drug(Step3, top_s3)
+    ) %>%
+    ungroup()
+  
+  return(df)
+}
+
+# ── 6. 구간별 링크 생성 헬퍼 함수 ───────────────────────────
+make_links_segment <- function(df, from_col, to_col, from_suffix, to_suffix) {
+  df %>%
+    filter(.data[[to_col]] != "-") %>%
+    group_by(
+      source_grp = .data[[from_col]],
+      target_grp = .data[[to_col]]
+    ) %>%
+    summarise(value = sum(pathwayPercent), .groups = "drop") %>%
+    mutate(
+      source = paste0(source_grp, from_suffix),
+      target = paste0(target_grp, to_suffix)
+    ) %>%
+    select(source, target, value)
+}
+
+# 중단 링크 생성: 다음 step이 없는 환자 → "중단" 노드로 연결
+make_links_stop <- function(df, from_col, to_col, from_suffix, stop_suffix) {
+  df %>%
+    filter(.data[[to_col]] == "-",
+           .data[[from_col]] != "-") %>%   # source가 "-"인 행 제외
+    group_by(source_grp = .data[[from_col]]) %>%
+    summarise(value = sum(pathwayPercent), .groups = "drop") %>%
+    mutate(
+      source = paste0(source_grp, from_suffix),
+      target = paste0("중단", stop_suffix)
+    ) %>%
+    select(source, target, value)
+}
+
+# ── 7. Sankey 생성 함수 (Step 1→2→3) ────────────────────────
+make_sankey3 <- function(file_path, hospital_name, top_n = 5) {
+  
+  df <- read.csv(file_path, stringsAsFactors = FALSE, fileEncoding = "UTF-8-BOM")
+  
+  df <- df %>%
+    rename(Step1 = Step.1, Step2 = Step.2, Step3 = Step.3) %>%
+    mutate(
+      pathwayPercent = as.numeric(gsub("%", "", pathwayPercent)) / 100,
+      across(c(Step1, Step2, Step3), ~ {
+        x <- clean_name(.x)
+        ifelse(trimws(x) == "", "-", x)
+      })
+    )
+  
+  df <- simplify_sankey3(df, top_n = top_n)
+  
+  # Step1이 유효하지 않은 행 제거
+  df <- df %>% filter(Step1_grp != "-")
+  
+  # 구간별 링크 생성
+  links_12      <- make_links_segment(df, "Step1_grp", "Step2_grp", " (S1)", " (S2)")
+  links_23      <- make_links_segment(df, "Step2_grp", "Step3_grp", " (S2)", " (S3)")
+  links_stop_s2 <- make_links_stop(df, "Step1_grp", "Step2_grp", " (S1)", " (S2)")  # S1에서 중단
+  links_stop_s3 <- make_links_stop(df, "Step2_grp", "Step3_grp", " (S2)", " (S3)")  # S2에서 중단
+  
+  links <- bind_rows(links_12, links_23, links_stop_s2, links_stop_s3)
+  
+  # 노드 생성 (중단 노드는 group = "중단"으로 처리)
+  nodes <- data.frame(
+    name = unique(c(links$source, links$target)),
+    stringsAsFactors = FALSE
+  ) %>%
+    mutate(
+      group = gsub(" \\(S[1-3]\\)", "", name),
+      label = gsub(" \\(S[1-3]\\)", "", name)
+    )
+  
+  # 인덱스 매핑
+  links <- links %>%
+    mutate(
+      source_name = source,
+      source      = match(source, nodes$name) - 1,
+      target      = match(target, nodes$name) - 1,
+      group       = gsub(" \\(S[1-3]\\)", "", source_name)
+    ) %>%
+    select(source, target, value, group)
+  
+  # 높이 자동 계산
+  n_nodes_s2  <- sum(grepl("S2", nodes$name))
+  auto_height <- max(600, n_nodes_s2 * 80)
+  
+  p <- sankeyNetwork(
+    Links       = links,
+    Nodes       = nodes,
+    Source      = "source",
+    Target      = "target",
+    Value       = "value",
+    NodeID      = "label",
+    NodeGroup   = "group",
+    LinkGroup   = "group",
+    colourScale = my_color,
+    fontSize    = 15,
+    nodeWidth   = 25,
+    nodePadding = 12,
+    sinksRight  = FALSE,
+    height      = auto_height,
+    width       = 1400
+  )
+  
+  # 제목 추가
+  p <- htmlwidgets::prependContent(
+    p,
+    htmltools::tags$h3(
+      hospital_name,
+      style = "text-align:center; font-family:sans-serif;"
+    )
+  )
+  
+  # 중단 노드·링크를 투명하게 숨김 (바 크기는 유지, 흐름선만 제거)
+  p <- htmlwidgets::onRender(p, '
+    function(el, x) {
+      var svg = d3.select(el).select("svg");
+      
+      // 링크 숨김: target이 "중단"인 링크
+      svg.selectAll(".link").each(function(d) {
+        if (d.target.name && d.target.name.indexOf("중단") !== -1) {
+          d3.select(this).style("display", "none");
+        }
+      });
+      
+      // 노드 숨김: "중단" 노드의 rect와 text만 숨김 (바 공간은 유지)
+      svg.selectAll(".node").each(function(d) {
+        if (d.name && d.name.indexOf("중단") !== -1) {
+          d3.select(this).select("rect").style("display", "none");
+          d3.select(this).select("text").style("display", "none");
+        }
+      });
+    }
+  ')
+  
+  return(list(plot = p, height = auto_height))
+}
+
+# ── 8. 실행 & PNG 저장 ──────────────────────────────────────
+for (h in names(hospital_files)) {
+  cat("처리 중:", h, "\n")
+  
+  result     <- make_sankey3(hospital_files[[h]], h, top_n = 5)
+  p          <- result$plot
+  png_height <- result$height
+  
+  print(p)
+  
+  # 1) 임시 HTML 저장
+  tmp_html <- paste0("sankey_step3_", h, "_tmp.html")
+  htmlwidgets::saveWidget(p, file = tmp_html, selfcontained = TRUE)
+  
+  # 2) HTML → PNG 변환
+  webshot2::webshot(
+    url     = tmp_html,
+    file    = paste0("sankey_step3_", h, ".png"),
+    vwidth  = 1400,
+    vheight = png_height + 200,
+    zoom    = 2,
+    delay   = 2
+  )
+  
+  # 3) 임시 HTML 삭제
+  file.remove(tmp_html)
+  
+  cat("PNG 저장 완료:", h, "\n\n")
+}

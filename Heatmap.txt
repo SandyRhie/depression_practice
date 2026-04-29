@@ -1,0 +1,236 @@
+install.packages("dplyr")
+
+
+install.packages("tidyr")
+install.packages("ggplot2")
+install.packages("stringr")
+install.packages("forcats")
+
+
+
+# ── 0. 패키지 로드 ──────────────────────────────────────────
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+library(forcats)
+
+# ── 1. 경로 설정 ────────────────────────────────────────────
+setwd("C:/Users/20903/OneDrive/바탕 화면/R 시험/0412 히트맵 시도")
+
+hospital_files <- list(
+  AUMC  = "AUMC_pathway_step4.csv",
+  KWMC  = "KWMC_pathway_step4.csv",
+  KDH   = "KDH_pathway_step4.csv",
+  KHNMC = "KHNMC_pathway_step4.csv",
+  EUMC  = "EUMC_pathway_step4.csv"
+)
+
+# index drug 3개
+index_drugs <- c("escitalopram", "Trazodone", "sertraline")
+
+# ── 2. 전처리 함수 ───────────────────────────────────────────
+clean_name <- function(x) {
+  x <- gsub("\\[[a-z]+\\]\\s*", "", x)
+  trimws(x)
+}
+
+# ── 3. 전체 데이터 로드 ──────────────────────────────────────
+load_all <- function(files) {
+  purrr::map_dfr(names(files), function(h) {
+    df <- read.csv(files[[h]], stringsAsFactors = FALSE, fileEncoding = "UTF-8-BOM")
+    df %>%
+      rename(Step1 = Step.1, Step2 = Step.2) %>%
+      mutate(
+        hospital = h,
+        Step1    = clean_name(Step1),
+        Step2    = ifelse(trimws(Step2) == "", "-", clean_name(Step2))
+      )
+  })
+}
+
+# ── 4. add-on 약물 추출 함수 ────────────────────────────────
+# Step1 = index drug 단독 처방 행만 대상
+# Step2에 index drug가 포함되어 있어야 진정한 add-on (switch 제외)
+extract_addon <- function(step2, index_drug) {
+  if (is.na(step2) || step2 == "-") return(NA_character_)
+  
+  # Step2에 index drug가 포함되지 않으면 → switch (add-on 아님)
+  if (!grepl(index_drug, step2, ignore.case = TRUE)) return(NA_character_)
+  
+  # index drug 이름 제거하여 add-on만 추출
+  addon <- str_remove_all(step2, regex(paste0("\\+?\\s*", index_drug, "\\s*\\+?"),
+                                       ignore_case = TRUE))
+  addon <- str_remove_all(addon, "^\\s*\\+\\s*|\\s*\\+\\s*$")
+  addon <- trimws(addon)
+  
+  if (addon == "") return(NA_character_)
+  addon
+}
+
+# ── 5. OR 계산 함수 ──────────────────────────────────────────
+# OR = 해당 병원의 add-on 선택 odds / 나머지 4개 병원(pooled) odds
+# a = 병원 h에서 addon=X인 환자 수
+# b = 병원 h에서 addon≠X인 환자 수 (add-on 있는 환자 중)
+# c = 나머지 병원에서 addon=X인 환자 수
+# d = 나머지 병원에서 addon≠X인 환자 수
+calc_or <- function(df, index_drug) {
+  
+  # Step1이 index drug 단독인 행만 필터
+  sub <- df %>%
+    filter(str_to_lower(Step1) == str_to_lower(index_drug))
+  
+  # add-on 추출
+  sub <- sub %>%
+    rowwise() %>%
+    mutate(addon = extract_addon(Step2, index_drug)) %>%
+    ungroup() %>%
+    filter(!is.na(addon)) %>%
+    mutate(addon = str_to_title(addon))
+  
+  if (nrow(sub) == 0) return(NULL)
+  
+  # 병원별 add-on 총 환자 수 (분모)
+  total_per_hosp <- sub %>%
+    group_by(hospital) %>%
+    summarise(total_h = sum(personCount), .groups = "drop")
+  
+  # 병원 × add-on 별 환자 수
+  counts <- sub %>%
+    group_by(hospital, addon) %>%
+    summarise(count = sum(personCount), .groups = "drop")
+  
+  # 전체 pooled 합계
+  total_pooled <- sum(total_per_hosp$total_h)
+  
+  # pooled add-on 별 환자 수
+  pooled_counts <- counts %>%
+    group_by(addon) %>%
+    summarise(count_pooled = sum(count), .groups = "drop")
+  
+  # OR 계산 (hospital h vs 나머지 병원)
+  result <- counts %>%
+    left_join(total_per_hosp, by = "hospital") %>%
+    left_join(pooled_counts,  by = "addon") %>%
+    mutate(
+      # 나머지 병원 수치
+      count_others = count_pooled - count,
+      total_others = total_pooled - total_h,
+      
+      a = count,
+      b = total_h     - count,
+      c = count_others,
+      d = total_others - count_others,
+      
+      OR     = ifelse(b > 0 & c > 0 & d > 0, (a * d) / (b * c), NA_real_),
+      log_OR = log(OR),
+      
+      # 표시용 라벨
+      label  = ifelse(is.na(OR), "—",
+               ifelse(OR >= 10, sprintf("%.0f", OR),
+                      sprintf("%.2f", OR))),
+      
+      index_drug = index_drug
+    ) %>%
+    select(index_drug, hospital, addon, count, OR, log_OR, label)
+  
+  return(result)
+}
+
+# ── 6. 전체 실행 ────────────────────────────────────────────
+df_all <- load_all(hospital_files)
+
+or_list <- lapply(index_drugs, function(idx) calc_or(df_all, idx))
+names(or_list) <- index_drugs
+
+# ── 7. 히트맵 그리기 함수 ───────────────────────────────────
+draw_heatmap <- function(or_df, index_drug) {
+  
+  if (is.null(or_df) || nrow(or_df) == 0) {
+    message("데이터 없음: ", index_drug)
+    return(NULL)
+  }
+  
+  hosp_order  <- c("AUMC", "KWMC", "KDH", "KHNMC", "EUMC")
+  
+  # add-on을 전체 pooled 빈도 내림차순으로 정렬 → 상위 5개만
+  addon_order <- or_df %>%
+    group_by(addon) %>%
+    summarise(total = sum(count), .groups = "drop") %>%
+    arrange(desc(total)) %>%
+    slice_head(n = 5) %>%
+    pull(addon)
+  
+  # 전체 조합 그리드 생성 (없는 병원-약물 조합 = NA)
+  grid <- expand.grid(
+    hospital = hosp_order,
+    addon    = addon_order,
+    stringsAsFactors = FALSE
+  )
+  
+  plot_df <- grid %>%
+    left_join(or_df, by = c("hospital", "addon")) %>%
+    mutate(
+      label    = ifelse(is.na(OR), "—", label),
+      hospital = factor(hospital, levels = hosp_order),
+      addon    = factor(addon,    levels = addon_order)
+    )
+  
+  # log_OR 범위 설정 (대칭)
+  max_abs <- max(abs(plot_df$log_OR), na.rm = TRUE)
+  if (!is.finite(max_abs) || max_abs == 0) max_abs <- 1
+  
+  ggplot(plot_df, aes(x = hospital, y = addon, fill = log_OR)) +
+    geom_tile(color = "white", linewidth = 0.6) +
+    geom_text(aes(label = label),
+              size = 4.5, fontface = "bold", color = "black") +
+    scale_x_discrete(position = "top") +
+    scale_y_discrete(limits = rev(addon_order)) +
+    scale_fill_gradient2(
+      low      = "#4575B4",   # OR < 1 (파랑)
+      mid      = "white",     # OR = 1
+      high     = "#D73027",   # OR > 1 (빨강)
+      midpoint = 0,
+      limits   = c(-max_abs, max_abs),
+      name     = "log(OR)",
+      na.value = "grey90"
+    ) +
+    labs(
+      title    = paste0("Add-on prescribing pattern — Index drug: ", tools::toTitleCase(tolower(index_drug))),
+      subtitle = NULL,
+      x        = NULL,
+      y        = NULL
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      plot.title       = element_text(face = "bold", size = 14),
+      plot.subtitle    = element_text(size = 9, color = "grey40"),
+      axis.text.x.top  = element_text(face = "bold", size = 12, angle = 0, hjust = 0.5),
+      axis.text.x      = element_blank(),
+      axis.ticks.x     = element_blank(),
+      axis.text.y      = element_text(size = 11),
+      panel.grid       = element_blank(),
+      legend.position  = "right",
+      plot.margin      = margin(20, 15, 15, 15)
+    )
+}
+
+# ── 8. 저장 ─────────────────────────────────────────────────
+for (idx in index_drugs) {
+  cat("히트맵 생성 중:", idx, "\n")
+  p <- draw_heatmap(or_list[[idx]], idx)
+  if (!is.null(p)) {
+    print(p)
+    n_addon <- length(unique(or_list[[idx]]$addon))
+    ggsave(
+      filename  = paste0("heatmap_addon_", idx, ".png"),
+      plot      = p,
+      width     = 8,
+      height    = 4.5,
+      dpi       = 300,
+      bg        = "white",
+      limitsize = FALSE
+    )
+    cat("저장 완료:", idx, "\n\n")
+  }
+}
